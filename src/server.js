@@ -77,6 +77,11 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/interactions/stream-post") {
+      await streamInteractionViaPost(req, res);
+      return;
+    }
+
     sendJson(res, 404, { error: "Not found" });
   } catch (error) {
     console.error(error);
@@ -92,37 +97,15 @@ server.listen(config.port, config.host, () => {
 });
 
 async function streamInteraction(req, res) {
-  const body = await readJsonBody(req);
-  const sessionCreatePayload = body?.sessionCreatePayload ?? {};
-  const interactionRequest = normalizeInteractionRequest(body?.interactionRequest);
-  const workflowId = body?.workflowId ?? config.workflowId;
-  let sessionId = body?.sessionId;
+  const { sessionCreatePayload, interactionRequest, workflowId, sessionId: rawSessionId } =
+    await parseStreamRequest(req);
 
   if (!interactionRequest) {
-    sendJson(res, 400, {
-      error: "interactionRequest is required and must be an object",
-    });
+    sendJson(res, 400, { error: "interactionRequest is required and must be an object" });
     return;
   }
 
-  if (!sessionId) {
-    const session = await createSession(sessionCreatePayload);
-
-    sessionId =
-      session?.uuid ||
-      session?.id ||
-      session?.session_id ||
-      session?.sessionId ||
-      null;
-
-    if (!sessionId) {
-      throw createError(
-        502,
-        "Session was created but no session id was found in the response",
-        session,
-      );
-    }
-  }
+  const sessionId = await resolveSessionId(rawSessionId, sessionCreatePayload);
 
   const eph = await createEphemeralToken(sessionId);
   const ephToken = eph?.token;
@@ -133,22 +116,14 @@ async function streamInteraction(req, res) {
   const wsUrl = buildWebSocketUrl({ sessionId, ephToken, workflowId });
   const streamId = randomUUID();
 
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-  });
-
+  startSseResponse(res);
   writeSse(res, "ready", { streamId, sessionId });
 
   const socket = new WebSocket(wsUrl);
   let closed = false;
 
   const closeStream = () => {
-    if (closed) {
-      return;
-    }
-
+    if (closed) return;
     closed = true;
     if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
       socket.close();
@@ -167,7 +142,6 @@ async function streamInteraction(req, res) {
   socket.addEventListener("message", (event) => {
     const raw = typeof event.data === "string" ? event.data : String(event.data);
     let parsed = raw;
-
     try {
       parsed = JSON.parse(raw);
     } catch {
@@ -176,39 +150,197 @@ async function streamInteraction(req, res) {
 
     writeSse(res, "packet", parsed);
 
-    const packetType =
-      typeof parsed === "object" && parsed !== null
-        ? String(parsed.type || parsed.kind || parsed.event || "").toUpperCase()
-        : null;
-    const operationCode =
-      typeof parsed === "object" && parsed !== null ? Number(parsed.operation) : NaN;
-
-    if (packetType === "DONE" || packetType === "ERROR" || operationCode === 3 || operationCode === 4) {
-      writeSse(res, "complete", {
-        streamId,
-        packetType,
-        operation: Number.isNaN(operationCode) ? null : operationCode,
-      });
+    const completion = detectCompletion(parsed);
+    if (completion) {
+      writeSse(res, "complete", { streamId, ...completion });
       closeStream();
     }
   });
 
   socket.addEventListener("error", () => {
-    writeSse(res, "error", {
-      streamId,
-      message: "WebSocket connection failed",
-    });
+    writeSse(res, "error", { streamId, message: "WebSocket connection failed" });
     closeStream();
   });
 
   socket.addEventListener("close", (event) => {
-    writeSse(res, "socket_close", {
-      streamId,
-      code: event.code,
-      reason: event.reason || null,
-    });
+    writeSse(res, "socket_close", { streamId, code: event.code, reason: event.reason || null });
     closeStream();
   });
+}
+
+async function streamInteractionViaPost(req, res) {
+  const { sessionCreatePayload, interactionRequest, workflowId, sessionId: rawSessionId } =
+    await parseStreamRequest(req);
+
+  if (!interactionRequest) {
+    sendJson(res, 400, { error: "interactionRequest is required and must be an object" });
+    return;
+  }
+
+  const sessionId = await resolveSessionId(rawSessionId, sessionCreatePayload);
+
+  const postPath = renderTemplate(config.postInteractionPathTemplate, {
+    agent_id: config.agentId,
+    session_id: sessionId,
+    account_id: config.accountId,
+    kb_id: config.kbId,
+  });
+
+  const postUrl = new URL(postPath, config.baseUrl);
+  if (workflowId) postUrl.searchParams.set("workflow_id", workflowId);
+
+  const streamId = randomUUID();
+
+  startSseResponse(res);
+  writeSse(res, "ready", { streamId, sessionId });
+
+  const upstream = await fetch(postUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(interactionRequest),
+  });
+
+  if (!upstream.ok) {
+    const text = await upstream.text();
+    writeSse(res, "error", { streamId, message: `RAO POST failed (${upstream.status}): ${text}` });
+    res.end();
+    return;
+  }
+
+  writeSse(res, "socket_open", { streamId, sessionId });
+  writeSse(res, "request_sent", { streamId });
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let closed = false;
+  let emittedComplete = false;
+
+  req.on("close", () => {
+    if (!closed) {
+      closed = true;
+      reader.cancel().catch(() => {});
+    }
+  });
+
+  try {
+    while (!closed) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const { objects, remaining } = extractJsonObjects(buffer);
+      buffer = remaining;
+
+      for (const obj of objects) {
+        writeSse(res, "packet", obj);
+
+        const completion = detectCompletion(obj);
+        if (completion) {
+          writeSse(res, "complete", { streamId, ...completion });
+          emittedComplete = true;
+          closed = true;
+          break;
+        }
+      }
+    }
+  } finally {
+    try { reader.cancel(); } catch {}
+    if (!emittedComplete) {
+      writeSse(res, "complete", { streamId, packetType: null, operation: null });
+    }
+    writeSse(res, "socket_close", { streamId, code: 1000, reason: null });
+    res.end();
+  }
+}
+
+function extractJsonObjects(buffer) {
+  const objects = [];
+  let i = 0;
+
+  while (i < buffer.length) {
+    while (i < buffer.length && /\s/.test(buffer[i])) i++;
+    if (i >= buffer.length || buffer[i] !== "{") {
+      if (i < buffer.length) i++;
+      continue;
+    }
+
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let j = i;
+
+    for (; j < buffer.length; j++) {
+      const c = buffer[j];
+      if (esc) { esc = false; continue; }
+      if (inStr) {
+        if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0) break;
+      }
+    }
+
+    if (depth === 0 && j < buffer.length) {
+      try {
+        objects.push(JSON.parse(buffer.slice(i, j + 1)));
+      } catch {}
+      i = j + 1;
+    } else {
+      break;
+    }
+  }
+
+  return { objects, remaining: buffer.slice(i) };
+}
+
+async function parseStreamRequest(req) {
+  const body = await readJsonBody(req);
+  return {
+    sessionCreatePayload: body?.sessionCreatePayload ?? {},
+    interactionRequest: normalizeInteractionRequest(body?.interactionRequest),
+    workflowId: body?.workflowId ?? config.workflowId,
+    sessionId: body?.sessionId ?? null,
+  };
+}
+
+async function resolveSessionId(sessionId, sessionCreatePayload) {
+  if (sessionId) return sessionId;
+  const session = await createSession(sessionCreatePayload);
+  const id = session?.uuid || session?.id || session?.session_id || session?.sessionId || null;
+  if (!id) {
+    throw createError(502, "Session was created but no session id was found in the response", session);
+  }
+  return id;
+}
+
+function startSseResponse(res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+  });
+}
+
+function detectCompletion(packet) {
+  if (typeof packet !== "object" || packet === null) return null;
+  const packetType = String(packet.type || packet.kind || packet.event || "").toUpperCase();
+  const operationCode = Number(packet.operation);
+  if (packetType === "DONE" || packetType === "ERROR" || operationCode === 3 || operationCode === 4) {
+    return {
+      packetType: packetType || null,
+      operation: Number.isNaN(operationCode) ? null : operationCode,
+    };
+  }
+  return null;
 }
 
 async function createEphemeralToken(sessionId) {
@@ -329,6 +461,9 @@ function buildConfig() {
   const websocketPathTemplate =
     process.env.RAO_WEBSOCKET_PATH_TEMPLATE ||
     "/api/v1/agent/{agent_id}/session/ephemeral/ws";
+  const postInteractionPathTemplate =
+    process.env.RAO_POST_INTERACTION_PATH_TEMPLATE ||
+    "/api/v1/agent/{agent_id}/session/ephemeral";
   const workflowId = process.env.RAO_WORKFLOW_ID || "default";
 
   return {
@@ -348,6 +483,7 @@ function buildConfig() {
     sessionPathTemplate,
     ephemeralTokensPathTemplate,
     websocketPathTemplate,
+    postInteractionPathTemplate,
     workflowId,
   };
 }
@@ -359,7 +495,6 @@ function normalizeInteractionRequest(request) {
 
   return {
     operation: 0,
-    headers: {},
     ...request,
     headers: request.headers && typeof request.headers === "object" ? request.headers : {},
   };
