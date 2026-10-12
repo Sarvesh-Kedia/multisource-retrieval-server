@@ -5,6 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "example:1": "node examples/1-ephemeral-post.mjs",
+    "example:2": "node examples/2-ephemeral-post-no-history.mjs",
+    "example:3": "node examples/3-persistent-post.mjs",
+    "example:4": "node examples/4-ephemeral-ws.mjs",
+    "example:5": "node examples/5-ephemeral-ws-no-history.mjs",
+    "example:6": "node examples/6-persistent-ws.mjs"
   }
 }

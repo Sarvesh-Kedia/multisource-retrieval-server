@@ -3,7 +3,30 @@ import { URL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 
+/**
+ * RAO demo relay server.
+ *
+ * Two independent switches describe how a question reaches the RAO agent:
+ *
+ *   transport    "post" | "ws"            how bytes move (HTTP POST stream vs WebSocket)
+ *   sessionMode  "ephemeral" | "persistent"  who remembers the conversation
+ *
+ *   ephemeral   -> RAO path uses the literal session id "ephemeral". Nothing is stored
+ *                  server-side, so the client must resend `chat_history` on every turn.
+ *   persistent  -> RAO path uses a real session id (created via POST /sessions). RAO
+ *                  stores every exchange, so the client omits `chat_history` and only
+ *                  keeps the session id. Sending `chat_history` on a persistent session
+ *                  overrides the stored history for that one request only.
+ *
+ * Both transports hit the same two path templates; only {session_id} changes:
+ *   POST  {baseUrl}/api/v1/agent/{agent_id}/session/{session_id}?workflow_id=...
+ *   WS    {wsBaseUrl}/api/v1/agent/{agent_id}/session/{session_id}/ws?eph-token=...&workflow_id=...
+ */
+
 loadEnvFile();
+
+const SESSION_MODES = new Set(["ephemeral", "persistent"]);
+const EPHEMERAL_SESSION_ID = "ephemeral";
 
 const config = buildConfig();
 const server = createServer(async (req, res) => {
@@ -30,50 +53,50 @@ const server = createServer(async (req, res) => {
         wsBaseUrl: config.wsBaseUrl,
         agentId: config.agentId,
         kbId: config.kbId,
+        workflowId: config.workflowId,
         hasApiKey: Boolean(config.apiKey),
         hasAccountId: Boolean(config.accountId),
       });
       return;
     }
 
+    // ---- Session management (only meaningful for sessionMode "persistent") ----
+
+    if (req.method === "GET" && url.pathname === "/api/sessions") {
+      const sessions = await raoRequest({ method: "GET", path: config.sessionsPath });
+      sendJson(res, 200, sessions);
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/sessions") {
       const body = await readJsonBody(req);
-      const payload = body ?? {};
-      const session = await createSession(payload);
+      const session = await createSession(body ?? {});
       sendJson(res, 201, session);
       return;
     }
 
-    if (req.method === "GET" && url.pathname.startsWith("/api/sessions/")) {
+    if (url.pathname.startsWith("/api/sessions/") && (req.method === "GET" || req.method === "DELETE")) {
       const sessionId = decodeURIComponent(url.pathname.split("/").pop());
-      const session = await raoRequest({
-        method: "GET",
-        path: renderTemplate(config.sessionPathTemplate, {
-          agent_id: config.agentId,
-          session_id: sessionId,
-          account_id: config.accountId,
-          kb_id: config.kbId,
-        }),
+      const result = await raoRequest({
+        method: req.method,
+        path: renderSessionPath(config.sessionPathTemplate, sessionId),
       });
-      sendJson(res, 200, session);
+      sendJson(res, 200, result ?? { ok: true });
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/ephemeral-token") {
       const body = await readJsonBody(req);
-      const sessionId = body?.sessionId;
-      if (!sessionId) {
-        sendJson(res, 400, { error: "sessionId is required" });
-        return;
-      }
-
+      const sessionId = body?.sessionId || EPHEMERAL_SESSION_ID;
       const token = await createEphemeralToken(sessionId);
       sendJson(res, 201, token);
       return;
     }
 
+    // ---- Interactions (SSE out, either transport in) ----
+
     if (req.method === "POST" && url.pathname === "/api/interactions/stream") {
-      await streamInteraction(req, res);
+      await streamInteractionViaWebSocket(req, res);
       return;
     }
 
@@ -96,28 +119,27 @@ server.listen(config.port, config.host, () => {
   console.log(`RAO MVP backend listening on http://${config.host}:${config.port}`);
 });
 
-async function streamInteraction(req, res) {
-  const { sessionCreatePayload, interactionRequest, workflowId, sessionId: rawSessionId } =
-    await parseStreamRequest(req);
+// ---------------------------------------------------------------------------
+// Transport 1: WebSocket upstream  ->  SSE downstream
+// ---------------------------------------------------------------------------
 
-  if (!interactionRequest) {
-    sendJson(res, 400, { error: "interactionRequest is required and must be an object" });
-    return;
-  }
+async function streamInteractionViaWebSocket(req, res) {
+  const prepared = await prepareInteraction(req, res);
+  if (!prepared) return;
+  const { interactionRequest, workflowId, session, streamId } = prepared;
 
-  const sessionId = await resolveSessionId(rawSessionId, sessionCreatePayload);
-
-  const eph = await createEphemeralToken(sessionId);
+  // Each WebSocket connection needs a fresh short-lived token bound to the session id
+  // ("ephemeral" or a real one). The long-lived API key never reaches the browser.
+  const eph = await createEphemeralToken(session.id);
   const ephToken = eph?.token;
   if (!ephToken) {
     throw createError(502, "Ephemeral token response did not include token", eph);
   }
 
-  const wsUrl = buildWebSocketUrl({ sessionId, ephToken, workflowId });
-  const streamId = randomUUID();
+  const wsUrl = buildWebSocketUrl({ sessionId: session.id, ephToken, workflowId });
 
   startSseResponse(res);
-  writeSse(res, "ready", { streamId, sessionId });
+  writeSse(res, "ready", { streamId, ...session, transport: "ws", upstream: redactUrl(wsUrl) });
 
   const socket = new WebSocket(wsUrl);
   let closed = false;
@@ -134,7 +156,7 @@ async function streamInteraction(req, res) {
   req.on("close", closeStream);
 
   socket.addEventListener("open", () => {
-    writeSse(res, "socket_open", { streamId, sessionId });
+    writeSse(res, "socket_open", { streamId, sessionId: session.id });
     socket.send(JSON.stringify(interactionRequest));
     writeSse(res, "request_sent", { streamId });
   });
@@ -168,31 +190,20 @@ async function streamInteraction(req, res) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Transport 2: HTTP POST (concatenated JSON stream) upstream  ->  SSE downstream
+// ---------------------------------------------------------------------------
+
 async function streamInteractionViaPost(req, res) {
-  const { sessionCreatePayload, interactionRequest, workflowId, sessionId: rawSessionId } =
-    await parseStreamRequest(req);
+  const prepared = await prepareInteraction(req, res);
+  if (!prepared) return;
+  const { interactionRequest, workflowId, session, streamId } = prepared;
 
-  if (!interactionRequest) {
-    sendJson(res, 400, { error: "interactionRequest is required and must be an object" });
-    return;
-  }
-
-  const sessionId = await resolveSessionId(rawSessionId, sessionCreatePayload);
-
-  const postPath = renderTemplate(config.postInteractionPathTemplate, {
-    agent_id: config.agentId,
-    session_id: sessionId,
-    account_id: config.accountId,
-    kb_id: config.kbId,
-  });
-
-  const postUrl = new URL(postPath, config.baseUrl);
+  const postUrl = new URL(renderSessionPath(config.interactionPathTemplate, session.id), config.baseUrl);
   if (workflowId) postUrl.searchParams.set("workflow_id", workflowId);
 
-  const streamId = randomUUID();
-
   startSseResponse(res);
-  writeSse(res, "ready", { streamId, sessionId });
+  writeSse(res, "ready", { streamId, ...session, transport: "post", upstream: postUrl.toString() });
 
   const upstream = await fetch(postUrl, {
     method: "POST",
@@ -210,7 +221,7 @@ async function streamInteractionViaPost(req, res) {
     return;
   }
 
-  writeSse(res, "socket_open", { streamId, sessionId });
+  writeSse(res, "socket_open", { streamId, sessionId: session.id });
   writeSse(res, "request_sent", { streamId });
 
   const reader = upstream.body.getReader();
@@ -255,6 +266,104 @@ async function streamInteractionViaPost(req, res) {
     writeSse(res, "socket_close", { streamId, code: 1000, reason: null });
     res.end();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Shared request handling
+// ---------------------------------------------------------------------------
+
+/**
+ * Parses the browser request and resolves which RAO session id to talk to.
+ * Returns null after writing a 400 when the body is invalid.
+ */
+async function prepareInteraction(req, res) {
+  const body = await readJsonBody(req);
+
+  const interactionRequest = normalizeInteractionRequest(body?.interactionRequest);
+  if (!interactionRequest) {
+    sendJson(res, 400, { error: "interactionRequest is required and must be an object" });
+    return null;
+  }
+
+  const sessionMode = String(body?.sessionMode || "ephemeral").toLowerCase();
+  if (!SESSION_MODES.has(sessionMode)) {
+    sendJson(res, 400, { error: `sessionMode must be one of: ${[...SESSION_MODES].join(", ")}` });
+    return null;
+  }
+
+  const session = await resolveSession({
+    sessionMode,
+    sessionId: body?.sessionId ?? null,
+    sessionCreatePayload: body?.sessionCreatePayload ?? {},
+  });
+
+  return {
+    interactionRequest,
+    workflowId: body?.workflowId ?? config.workflowId,
+    session,
+    streamId: randomUUID(),
+  };
+}
+
+/**
+ * ephemeral  -> always the literal id "ephemeral"; RAO stores nothing.
+ * persistent -> the caller's session id, or a freshly created one when absent.
+ */
+async function resolveSession({ sessionMode, sessionId, sessionCreatePayload }) {
+  if (sessionMode === "ephemeral") {
+    return { sessionId: EPHEMERAL_SESSION_ID, id: EPHEMERAL_SESSION_ID, sessionMode, sessionCreated: false };
+  }
+
+  if (sessionId && sessionId !== EPHEMERAL_SESSION_ID) {
+    return { sessionId, id: sessionId, sessionMode, sessionCreated: false };
+  }
+
+  const session = await createSession(sessionCreatePayload);
+  const id = session?.uuid || session?.id || session?.session_id || session?.sessionId || null;
+  if (!id) {
+    throw createError(502, "Session was created but no session id was found in the response", session);
+  }
+  return { sessionId: id, id, sessionMode, sessionCreated: true };
+}
+
+/**
+ * Shape sent upstream on both transports. `chat_history` is forwarded only when the
+ * client sent an array, so omitting it keeps RAO's server-side history (persistent mode)
+ * and sending [] explicitly clears context for that request.
+ */
+function normalizeInteractionRequest(request) {
+  if (!request || typeof request !== "object") {
+    return null;
+  }
+
+  const normalized = {
+    operation: 0,
+    ...request,
+    headers: request.headers && typeof request.headers === "object" ? request.headers : {},
+  };
+
+  if (Array.isArray(request.chat_history)) {
+    normalized.chat_history = request.chat_history
+      .filter((turn) => turn && typeof turn === "object")
+      .map((turn) => ({ question: String(turn.question ?? ""), answer: String(turn.answer ?? "") }));
+  } else {
+    delete normalized.chat_history;
+  }
+
+  return normalized;
+}
+
+function detectCompletion(packet) {
+  if (typeof packet !== "object" || packet === null) return null;
+  const packetType = String(packet.type || packet.kind || packet.event || "").toUpperCase();
+  const operationCode = Number(packet.operation);
+  if (packetType === "DONE" || packetType === "ERROR" || operationCode === 3 || operationCode === 4) {
+    return {
+      packetType: packetType || null,
+      operation: Number.isNaN(operationCode) ? null : operationCode,
+    };
+  }
+  return null;
 }
 
 function extractJsonObjects(buffer) {
@@ -302,46 +411,9 @@ function extractJsonObjects(buffer) {
   return { objects, remaining: buffer.slice(i) };
 }
 
-async function parseStreamRequest(req) {
-  const body = await readJsonBody(req);
-  return {
-    sessionCreatePayload: body?.sessionCreatePayload ?? {},
-    interactionRequest: normalizeInteractionRequest(body?.interactionRequest),
-    workflowId: body?.workflowId ?? config.workflowId,
-    sessionId: body?.sessionId ?? null,
-  };
-}
-
-async function resolveSessionId(sessionId, sessionCreatePayload) {
-  if (sessionId) return sessionId;
-  const session = await createSession(sessionCreatePayload);
-  const id = session?.uuid || session?.id || session?.session_id || session?.sessionId || null;
-  if (!id) {
-    throw createError(502, "Session was created but no session id was found in the response", session);
-  }
-  return id;
-}
-
-function startSseResponse(res) {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-  });
-}
-
-function detectCompletion(packet) {
-  if (typeof packet !== "object" || packet === null) return null;
-  const packetType = String(packet.type || packet.kind || packet.event || "").toUpperCase();
-  const operationCode = Number(packet.operation);
-  if (packetType === "DONE" || packetType === "ERROR" || operationCode === 3 || operationCode === 4) {
-    return {
-      packetType: packetType || null,
-      operation: Number.isNaN(operationCode) ? null : operationCode,
-    };
-  }
-  return null;
-}
+// ---------------------------------------------------------------------------
+// RAO REST helpers
+// ---------------------------------------------------------------------------
 
 async function createEphemeralToken(sessionId) {
   const path = renderTemplate(config.ephemeralTokensPathTemplate, {
@@ -360,7 +432,24 @@ async function createEphemeralToken(sessionId) {
   });
 }
 
-async function createSession(payload) {
+/**
+ * RAO requires slug, name, summary, data and format on create. Callers may pass any
+ * subset; the rest is filled with demo defaults so `{}` is a valid create payload.
+ */
+function buildSessionCreatePayload(payload = {}) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").toLowerCase();
+  return {
+    slug: `rao-demo-${stamp}`,
+    name: `RAO demo ${stamp}`,
+    summary: "Conversation created by the RAO demo UI",
+    data: "",
+    format: "PLAIN",
+    ...payload,
+  };
+}
+
+async function createSession(rawPayload) {
+  const payload = buildSessionCreatePayload(rawPayload ?? {});
   try {
     return await raoRequest({
       method: "POST",
@@ -422,24 +511,40 @@ async function raoRequest({ method, path, body }) {
     );
   }
 
-  return data ?? { raw: text };
+  return data ?? (text ? { raw: text } : null);
 }
 
 function buildWebSocketUrl({ sessionId, ephToken, workflowId }) {
-  const wsPath = renderTemplate(config.websocketPathTemplate, {
-    agent_id: config.agentId,
-    session_id: sessionId,
-    account_id: config.accountId,
-    kb_id: config.kbId,
-  });
-
-  const url = new URL(wsPath, config.wsBaseUrl);
+  const url = new URL(renderSessionPath(config.websocketPathTemplate, sessionId), config.wsBaseUrl);
   url.searchParams.set("eph-token", ephToken);
   if (workflowId) {
     url.searchParams.set("workflow_id", workflowId);
   }
   return url.toString();
 }
+
+function renderSessionPath(template, sessionId) {
+  return renderTemplate(template, {
+    agent_id: config.agentId,
+    session_id: sessionId,
+    account_id: config.accountId,
+    kb_id: config.kbId,
+  });
+}
+
+function redactUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.searchParams.has("eph-token")) url.searchParams.set("eph-token", "<redacted>");
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
 
 function buildConfig() {
   const baseUrl = requiredEnv("RAO_BASE_URL");
@@ -450,21 +555,36 @@ function buildConfig() {
   const wsBaseUrl =
     process.env.RAO_WS_BASE_URL ||
     baseUrl.replace(/^https:/i, "wss:").replace(/^http:/i, "ws:");
+
+  // Session CRUD
   const sessionsPathTemplate =
     process.env.RAO_SESSIONS_PATH_TEMPLATE || "/api/v1/agent/{agent_id}/sessions";
   const sessionPathTemplate =
-    process.env.RAO_SESSION_PATH_TEMPLATE ||
-    "/api/v1/agent/{agent_id}/sessions/{session_id}";
+    process.env.RAO_SESSION_PATH_TEMPLATE || "/api/v1/agent/{agent_id}/session/{session_id}";
   const ephemeralTokensPathTemplate =
     process.env.RAO_EPHEMERAL_TOKENS_PATH_TEMPLATE ||
     "/api/v1/account/{account_id}/kb/{kb_id}/ephemeral_tokens";
+
+  // Interactions. {session_id} is "ephemeral" or a real session id depending on sessionMode.
+  const interactionPathTemplate =
+    process.env.RAO_INTERACTION_PATH_TEMPLATE ||
+    process.env.RAO_POST_INTERACTION_PATH_TEMPLATE ||
+    "/api/v1/agent/{agent_id}/session/{session_id}";
   const websocketPathTemplate =
     process.env.RAO_WEBSOCKET_PATH_TEMPLATE ||
-    "/api/v1/agent/{agent_id}/session/ephemeral/ws";
-  const postInteractionPathTemplate =
-    process.env.RAO_POST_INTERACTION_PATH_TEMPLATE ||
-    "/api/v1/agent/{agent_id}/session/ephemeral";
+    "/api/v1/agent/{agent_id}/session/{session_id}/ws";
   const workflowId = process.env.RAO_WORKFLOW_ID || "default";
+
+  for (const [name, template] of [
+    ["RAO_INTERACTION_PATH_TEMPLATE", interactionPathTemplate],
+    ["RAO_WEBSOCKET_PATH_TEMPLATE", websocketPathTemplate],
+  ]) {
+    if (!template.includes("{session_id}")) {
+      console.warn(
+        `[config] ${name} has no {session_id} placeholder; sessionMode will have no effect on that transport.`,
+      );
+    }
+  }
 
   return {
     port: Number(process.env.PORT || 3001),
@@ -482,21 +602,9 @@ function buildConfig() {
     }),
     sessionPathTemplate,
     ephemeralTokensPathTemplate,
+    interactionPathTemplate,
     websocketPathTemplate,
-    postInteractionPathTemplate,
     workflowId,
-  };
-}
-
-function normalizeInteractionRequest(request) {
-  if (!request || typeof request !== "object") {
-    return null;
-  }
-
-  return {
-    operation: 0,
-    ...request,
-    headers: request.headers && typeof request.headers === "object" ? request.headers : {},
   };
 }
 
@@ -544,10 +652,14 @@ function requiredEnv(name) {
   return value;
 }
 
+// ---------------------------------------------------------------------------
+// HTTP plumbing
+// ---------------------------------------------------------------------------
+
 function setCorsHeaders(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
 }
 
 function sendJson(res, statusCode, data) {
@@ -559,6 +671,14 @@ function sendJson(res, statusCode, data) {
     "Content-Type": "application/json; charset=utf-8",
   });
   res.end(JSON.stringify(data, null, 2));
+}
+
+function startSseResponse(res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+  });
 }
 
 function writeSse(res, event, data) {
