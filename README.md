@@ -35,11 +35,11 @@ For the full decision guide on session modes and transports see [BLUEPRINT.md](.
 
 | Variable | Purpose |
 |---|---|
-| `RAO_BASE_URL` | Base HTTPS URL of the RAO API |
-| `RAO_AGENT_ID` | Agent UUID |
+| `RAO_BASE_URL` | `https://<region>.dp.progress.cloud`; the region is shown in the agent's Settings section |
+| `RAO_AGENT_ID` | Agent UUID, from the agent's Settings section |
 | `RAO_API_KEY` | Long-lived JWT (RS256) — Bearer token for REST and HTTP POST streaming |
 | `RAO_ACCOUNT_ID` | Account UUID (used in ephemeral token path) |
-| `RAO_KB_ID` | Knowledge base UUID (defaults to `RAO_AGENT_ID`) |
+| `RAO_KB_ID` | Knowledge box UUID; for a RAO agent this is the same value as `RAO_AGENT_ID` (defaults to it) |
 | `RAO_WORKFLOW_ID` | Workflow name sent as `?workflow_id=` (defaults to `"default"`) |
 | `RAO_INTERACTION_PATH_TEMPLATE` | POST interaction path, default `/api/v1/agent/{agent_id}/session/{session_id}` |
 | `RAO_WEBSOCKET_PATH_TEMPLATE` | WebSocket path, default `/api/v1/agent/{agent_id}/session/{session_id}/ws` |
