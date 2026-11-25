@@ -388,9 +388,9 @@ session creation, ephemeral token minting, and the two stream readers (`consumeJ
 - **Submit / Stop**: starts or cancels the current interaction. Switching chats is
   disabled during a run so answers cannot be appended to another conversation.
 
-The sidebar spans the full left side; New chat lives there. The header shows the
-app title and active stage without a status pill or turn counts. The request
-payload disclosure shows the actual JSON and upstream URL. There is no history toggle,
+The full-height sidebar contains New chat and saved conversations. The current turn
+displays progress inline. Run details includes the request JSON and upstream URL.
+Enter sends a message and Shift+Enter inserts a line break. There is no history toggle,
 persistent-session selector, or scenario picker in the current UI. Persistent examples
 and no-history baselines remain available as standalone scripts only.
 
