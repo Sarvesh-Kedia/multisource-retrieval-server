@@ -6,6 +6,27 @@ to the browser as Server-Sent Events (SSE) regardless of the upstream transport.
 
 For the full decision guide on session modes and transports see [BLUEPRINT.md](./BLUEPRINT.md).
 
+**Production status (25 November 2026, reported by the project owner):** Ephemeral +
+HTTP POST and Ephemeral + WebSocket are available. Persistent + HTTP POST and Persistent +
+WebSocket are currently **unavailable in production**; they depend on the platform's
+Memory function, which is separate from request-level `chat_history`. Persistent routes
+and examples remain as demo code, not evidence of production availability. See the
+[four-approach matrix and ephemeral conversation tracking guide](./BLUEPRINT.md).
+
+With either ephemeral transport, the application stores and identifies the conversation
+itself and resends prior `{ question, answer }` pairs as `chat_history` on every turn.
+The API's literal `ephemeral` ID and short-lived authentication token do not identify a
+durable chat conversation.
+
+**Conversation storage:** For this RAO Demo, the frontend owns saved
+chats in `localStorage` and sends history on every ephemeral turn; this relay
+remains stateless. For production, the backend should own conversations and
+messages in a durable database, load history by an authorized application conversation
+ID, and build `chat_history` itself. Neither approach requires the currently unavailable
+platform Memory feature. See the [demo and production design](./BLUEPRINT.md#rao-demo-conversation-storage).
+Saved-chat persistence and the sidebar are implemented in the frontend; production
+database storage remains an architectural recommendation.
+
 ## What it does
 
 - Holds the long-lived `RAO_API_KEY` JWT — never exposed to the browser
